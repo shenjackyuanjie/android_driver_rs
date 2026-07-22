@@ -1,0 +1,16 @@
+{
+  "u2.jar": {
+    "version": "0.4.0",
+    "size": 3707333,
+    "sha256": "0b74e83c55f443539a9f76f5ce023a51466b764b1100e4097a897053fdfc0eb6",
+    "source": "https://github.com/openatx/android-uiautomator-server-jar/releases/tag/0.4.0",
+    "license": "MIT"
+  },
+  "app-uiautomator.apk": {
+    "version": "2.4.0",
+    "size": 1873729,
+    "sha256": "6f85594700ad96de89d012b3767049c2c6988510b68b31b439dd2a6dd93a30c9",
+    "source": "https://github.com/openatx/android-uiautomator-server/releases/tag/2.4.0",
+    "license": "MIT"
+  }
+}

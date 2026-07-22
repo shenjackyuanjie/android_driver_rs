@@ -1,0 +1,30 @@
+[package]
+name = "android_driver_rs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "基于 ADB 和 u2.jar 的原生 Rust Android UI 自动化驱动"
+license = "MIT"
+
+[features]
+default = ["blocking", "embedded-agent", "input-method"]
+blocking = []
+embedded-agent = []
+input-method = []
+
+[dependencies]
+base64 = "0.22"
+quick-xml = "0.41"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sxd-document = "0.3"
+sxd-xpath = "0.4"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
