@@ -85,26 +85,83 @@ impl Selector {
 
     pub(crate) fn value(&self, index: usize) -> Value {
         let mut output = Map::new();
+        let mut mask = 0_u32;
+        output.insert("childOrSibling".into(), json!([]));
+        output.insert("childOrSiblingSelector".into(), json!([]));
         for condition in &self.conditions {
             match condition {
                 Condition::Boolean(name, value) => {
                     output.insert((*name).into(), json!(value));
+                    mask |= field_mask(name);
                 }
                 Condition::String(name, pattern) => {
-                    let (suffix, value) = match pattern {
-                        MatchPattern::Equals(value) => ("", value),
-                        MatchPattern::Contains(value) => ("Contains", value),
-                        MatchPattern::StartsWith(value) => ("StartsWith", value),
-                        MatchPattern::EndsWith(value) => ("EndsWith", value),
-                    };
-                    output.insert(format!("{name}{suffix}"), json!(value));
+                    let (key, value) = string_field(name, pattern);
+                    mask |= field_mask(&key);
+                    output.insert(key, json!(value));
                 }
             }
         }
         if index > 0 {
             output.insert("instance".into(), json!(index));
+            mask |= field_mask("instance");
         }
+        output.insert("mask".into(), json!(mask));
         Value::Object(output)
+    }
+}
+
+fn string_field(name: &str, pattern: &MatchPattern) -> (String, String) {
+    match pattern {
+        MatchPattern::Equals(value) => (name.into(), value.clone()),
+        MatchPattern::Contains(value) if matches!(name, "text" | "description") => {
+            (format!("{name}Contains"), value.clone())
+        }
+        MatchPattern::StartsWith(value) if matches!(name, "text" | "description") => {
+            (format!("{name}StartsWith"), value.clone())
+        }
+        MatchPattern::Contains(value) => (
+            format!("{name}Matches"),
+            format!(".*{}.*", regex::escape(value)),
+        ),
+        MatchPattern::StartsWith(value) => (
+            format!("{name}Matches"),
+            format!("^{}.*", regex::escape(value)),
+        ),
+        MatchPattern::EndsWith(value) => (
+            format!("{name}Matches"),
+            format!(".*{}$", regex::escape(value)),
+        ),
+    }
+}
+
+fn field_mask(name: &str) -> u32 {
+    match name {
+        "text" => 0x01,
+        "textContains" => 0x02,
+        "textMatches" => 0x04,
+        "textStartsWith" => 0x08,
+        "className" => 0x10,
+        "classNameMatches" => 0x20,
+        "description" => 0x40,
+        "descriptionContains" => 0x80,
+        "descriptionMatches" => 0x0100,
+        "descriptionStartsWith" => 0x0200,
+        "checkable" => 0x0400,
+        "checked" => 0x0800,
+        "clickable" => 0x1000,
+        "longClickable" => 0x2000,
+        "scrollable" => 0x4000,
+        "enabled" => 0x8000,
+        "focusable" => 0x010000,
+        "focused" => 0x020000,
+        "selected" => 0x040000,
+        "packageName" => 0x080000,
+        "packageNameMatches" => 0x100000,
+        "resourceId" => 0x200000,
+        "resourceIdMatches" => 0x400000,
+        "index" => 0x800000,
+        "instance" => 0x01000000,
+        _ => 0,
     }
 }
 
@@ -216,4 +273,21 @@ fn value_string(value: Value) -> Result<String> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| DriverError::Protocol("控件属性不是字符串".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializes_official_uiautomator_selector_mask() {
+        let value = Selector::new()
+            .text(MatchPattern::Contains("新闻".into()))
+            .clickable(true)
+            .value(2);
+        assert_eq!(value["textContains"], "新闻");
+        assert_eq!(value["instance"], 2);
+        assert_eq!(value["mask"], json!(0x02 | 0x1000 | 0x01000000));
+        assert_eq!(value["childOrSibling"], json!([]));
+    }
 }

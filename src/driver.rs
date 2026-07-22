@@ -431,6 +431,14 @@ impl AndroidDriver {
         ));
         #[cfg(feature = "input-method")]
         {
+            let focused = Selector::new().focused(true).value(0);
+            if self
+                .call_json_rpc("setText", json!([focused, text]))
+                .await
+                .is_ok_and(|value| value.as_bool() != Some(false))
+            {
+                return Ok(());
+            }
             self.ensure_fast_input_ime().await?;
             let original = self
                 .inner
@@ -451,25 +459,30 @@ impl AndroidDriver {
             };
             self.inner
                 .adb
-                .shell(["ime", "enable", "com.github.uiautomator/.FastInputIME"])
+                .shell(["ime", "enable", "com.github.uiautomator/.AdbKeyboard"])
                 .await?;
             self.inner
                 .adb
-                .shell(["ime", "set", "com.github.uiautomator/.FastInputIME"])
+                .shell(["ime", "set", "com.github.uiautomator/.AdbKeyboard"])
                 .await?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-            self.inner
+            let output = self
+                .inner
                 .adb
                 .shell([
                     "am",
                     "broadcast",
                     "-a",
-                    "ADB_SET_TEXT",
+                    "ADB_KEYBOARD_INPUT_TEXT",
                     "--es",
                     "text",
                     &encoded,
                 ])
-                .await?;
+                .await?
+                .stdout;
+            if !output.contains("result=-1") {
+                return Err(DriverError::InputMethod("辅助输入法广播未成功".into()));
+            }
             guard.restore().await
         }
     }
@@ -494,6 +507,7 @@ impl AndroidDriver {
                 [
                     OsString::from("install"),
                     OsString::from("-r"),
+                    OsString::from("-t"),
                     apk.as_os_str().to_os_string(),
                 ],
                 self.inner.adb.transfer_timeout(),
@@ -528,20 +542,25 @@ impl AndroidDriver {
                 self.inner.adb.transfer_timeout(),
             )
             .await?;
-        validate_png(output.stdout)
+        validate_image(output.stdout)
     }
     async fn u2_screenshot(&self) -> Result<Vec<u8>> {
-        let value = self
-            .call_json_rpc("takeScreenshot", json!([1, 100]))
-            .await?;
+        let value = self.call_json_rpc("takeScreenshot", json!([1, 80])).await?;
         let encoded = value
             .as_str()
             .or_else(|| value.get("data").and_then(Value::as_str))
-            .ok_or(DriverError::InvalidScreenshot)?;
+            .ok_or_else(|| DriverError::InvalidScreenshot("RPC 未返回 base64 字符串".into()))?;
+        let encoded = encoded
+            .trim_start_matches("data:image/png;base64,")
+            .trim_start_matches("data:image/jpeg;base64,");
+        let compact = encoded
+            .bytes()
+            .filter(|value| !value.is_ascii_whitespace())
+            .collect::<Vec<_>>();
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim_start_matches("data:image/png;base64,"))
-            .map_err(|_| DriverError::InvalidScreenshot)?;
-        validate_png(bytes)
+            .decode(compact)
+            .map_err(|error| DriverError::InvalidScreenshot(format!("base64 解码失败：{error}")))?;
+        validate_image(bytes)
     }
     pub async fn screenshot_to(&self, path: impl AsRef<Path>) -> Result<()> {
         tokio::fs::write(path, self.screenshot().await?)
@@ -1042,11 +1061,18 @@ fn validate_point(point: Point) -> Result<()> {
     }
 }
 
-fn validate_png(bytes: Vec<u8>) -> Result<Vec<u8>> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+fn validate_image(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.starts_with(b"\xff\xd8\xff") {
         Ok(bytes)
     } else {
-        Err(DriverError::InvalidScreenshot)
+        let magic = bytes
+            .iter()
+            .take(8)
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        Err(DriverError::InvalidScreenshot(format!(
+            "未知图像魔数 {magic}"
+        )))
     }
 }
 
@@ -1067,7 +1093,8 @@ mod tests {
 
     #[test]
     fn validates_png_signature() {
-        assert!(validate_png(b"\x89PNG\r\n\x1a\nrest".to_vec()).is_ok());
-        assert!(validate_png(b"bad".to_vec()).is_err());
+        assert!(validate_image(b"\x89PNG\r\n\x1a\nrest".to_vec()).is_ok());
+        assert!(validate_image(b"\xff\xd8\xffrest".to_vec()).is_ok());
+        assert!(validate_image(b"bad".to_vec()).is_err());
     }
 }

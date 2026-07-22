@@ -162,10 +162,16 @@ async fn read_http_message(stream: &mut TcpStream, max_size: usize) -> Result<Ve
     let mut buffer = [0_u8; 8192];
     loop {
         let read = stream.read(&mut buffer).await.map_err(DriverError::RpcIo)?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         response.extend_from_slice(&buffer[..read]);
-        if response.len() > max_size + 16 * 1024 { return Err(DriverError::Protocol("HTTP 响应超过大小上限".into())); }
-        if response_complete(&response, max_size)? { break; }
+        if response.len() > max_size + 16 * 1024 {
+            return Err(DriverError::Protocol("HTTP 响应超过大小上限".into()));
+        }
+        if response_complete(&response, max_size)? {
+            break;
+        }
     }
     Ok(response)
 }

@@ -67,8 +67,8 @@ pub enum DriverError {
     DriverClosed,
     #[error("不能在 Tokio 异步上下文中调用 blocking API")]
     BlockingInAsyncContext,
-    #[error("截图数据无效")]
-    InvalidScreenshot,
+    #[error("截图数据无效：{0}")]
+    InvalidScreenshot(String),
     #[error("辅助输入法不可用：{0}")]
     InputMethod(String),
 }
