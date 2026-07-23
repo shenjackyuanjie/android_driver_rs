@@ -172,7 +172,7 @@ impl AndroidDriver {
     }
 
     /// 调用 u2 HTTP JSON-RPC。调用不会自动重放。
-        pub async fn call_json_rpc(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn call_json_rpc(&self, method: &str, params: Value) -> Result<Value> {
         trace!(target: "android_driver_rs::driver", method, "调用 RPC");
         let rpc = {
             let state = self.inner.state.lock().await;
