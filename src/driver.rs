@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
+use tracing::{debug, info, trace, warn};
 
 const DEFAULT_AGENT_PORT: u16 = 9008;
 const OWNED_AGENT_PORTS: std::ops::RangeInclusive<u16> = 19008..=19017;
@@ -76,12 +77,14 @@ impl AndroidDriverBuilder {
     }
 
     pub async fn connect(self) -> Result<AndroidDriver> {
+        info!(target: "android_driver_rs::driver", "开始连接设备");
         let discovery = AdbRunner::new(self.adb)?;
         let descriptor = discovery.select(&self.selector).await?;
         let adb = discovery.with_serial(descriptor.serial);
         let files = agent::materialize(&self.source).await?;
         deploy_jar(&adb, &files.jar).await?;
         let session = establish_session(&adb, &self.config).await?;
+        info!(target: "android_driver_rs::driver", "设备连接成功");
         Ok(AndroidDriver {
             inner: Arc::new(DriverInner {
                 adb,
@@ -169,7 +172,8 @@ impl AndroidDriver {
     }
 
     /// 调用 u2 HTTP JSON-RPC。调用不会自动重放。
-    pub async fn call_json_rpc(&self, method: &str, params: Value) -> Result<Value> {
+        pub async fn call_json_rpc(&self, method: &str, params: Value) -> Result<Value> {
+        trace!(target: "android_driver_rs::driver", method, "调用 RPC");
         let rpc = {
             let state = self.inner.state.lock().await;
             if state.closed {
@@ -182,6 +186,7 @@ impl AndroidDriver {
 
     /// 清理旧会话并重新启动/借用 Agent。generation 成功后递增。
     pub async fn recover(&self) -> Result<()> {
+        warn!(target: "android_driver_rs::driver", "开始恢复会话");
         let mut state = self.inner.state.lock().await;
         if state.closed {
             return Err(DriverError::DriverClosed);
@@ -201,11 +206,13 @@ impl AndroidDriver {
         self.inner
             .generation
             .store(state.generation, Ordering::Release);
+        info!(target: "android_driver_rs::driver", "会话恢复成功");
         Ok(())
     }
 
     /// 恢复输入法并精确清理自有 Agent 与 forward。可安全重复调用。
     pub async fn close(&self) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", "关闭会话");
         let mut state = self.inner.state.lock().await;
         if state.closed {
             return Ok(());
@@ -221,10 +228,13 @@ impl AndroidDriver {
 
     pub async fn display_size(&self) -> Result<DisplaySize> {
         let output = self.inner.adb.shell(["wm", "size"]).await?.stdout;
-        parse_display_size(&output).ok_or_else(|| DriverError::Protocol("无法解析 wm size".into()))
+        let result = parse_display_size(&output);
+        trace!(target: "android_driver_rs::driver", ?result, "display_size");
+        result.ok_or_else(|| DriverError::Protocol("无法解析 wm size".into()))
     }
 
     pub async fn device_info(&self) -> Result<DeviceInfo> {
+        debug!(target: "android_driver_rs::driver", "收集设备信息");
         let manufacturer = self.property("ro.product.manufacturer").await?;
         let model = self.property("ro.product.model").await?;
         let android_version = self.property("ro.build.version.release").await?;
@@ -256,6 +266,7 @@ impl AndroidDriver {
     }
 
     pub async fn screen_state(&self) -> Result<ScreenState> {
+        trace!(target: "android_driver_rs::driver", "获取屏幕状态");
         let output = self.inner.adb.shell(["dumpsys", "power"]).await?.stdout;
         if output.contains("mWakefulness=Awake") || output.contains("Display Power: state=ON") {
             Ok(ScreenState::Awake)
@@ -269,18 +280,21 @@ impl AndroidDriver {
     }
 
     pub async fn screen_on(&self) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", "点亮屏幕");
         if self.screen_state().await? != ScreenState::Awake {
             self.press_key(AndroidKeyCode::POWER).await?;
         }
         Ok(())
     }
     pub async fn screen_off(&self) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", "熄灭屏幕");
         if self.screen_state().await? == ScreenState::Awake {
             self.press_key(AndroidKeyCode::POWER).await?;
         }
         Ok(())
     }
     pub async fn unlock(&self) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", "解锁屏幕");
         self.inner
             .adb
             .shell(["wm", "dismiss-keyguard"])
@@ -289,9 +303,11 @@ impl AndroidDriver {
     }
 
     pub async fn press_key(&self, key: impl Into<AndroidKeyCode>) -> Result<()> {
+        let code = key.into().0;
+        trace!(target: "android_driver_rs::driver", key_code = code, "按键");
         self.inner
             .adb
-            .shell(["input".into(), "keyevent".into(), key.into().0.to_string()])
+            .shell(["input".into(), "keyevent".into(), code.to_string()])
             .await
             .map(|_| ())
     }
@@ -304,6 +320,7 @@ impl AndroidDriver {
 
     pub async fn click(&self, point: Point) -> Result<()> {
         validate_point(point)?;
+        trace!(target: "android_driver_rs::driver", x = point.x, y = point.y, "点击");
         self.inner
             .adb
             .shell([
@@ -320,11 +337,13 @@ impl AndroidDriver {
             .await
     }
     pub async fn long_click(&self, point: Point, duration_ms: u32) -> Result<()> {
+        trace!(target: "android_driver_rs::driver", x = point.x, y = point.y, duration_ms, "长按");
         self.swipe(point, point, duration_ms).await
     }
     pub async fn swipe(&self, from: Point, to: Point, duration_ms: u32) -> Result<()> {
         validate_point(from)?;
         validate_point(to)?;
+        trace!(target: "android_driver_rs::driver", from_x = from.x, from_y = from.y, to_x = to.x, to_y = to.y, duration_ms, "滑动");
         self.inner
             .adb
             .shell([
@@ -355,6 +374,7 @@ impl AndroidDriver {
         package: &AppIdentifier,
         activity: Option<&ActivityName>,
     ) -> Result<()> {
+        info!(target: "android_driver_rs::driver", package = %package.as_str(), activity = ?activity.map(ActivityName::as_str), "启动应用");
         let activity = match activity {
             Some(value) => value.as_str().to_owned(),
             None => self.resolve_activity(package).await?,
@@ -396,6 +416,7 @@ impl AndroidDriver {
     }
 
     pub async fn stop_app(&self, package: &AppIdentifier) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", package = %package.as_str(), "停止应用");
         self.inner
             .adb
             .shell(["am", "force-stop", package.as_str()])
@@ -404,6 +425,7 @@ impl AndroidDriver {
     }
 
     pub async fn current_app(&self) -> Result<Option<(AppIdentifier, ActivityName)>> {
+        trace!(target: "android_driver_rs::driver", "获取当前前台应用");
         let output = self
             .inner
             .adb
@@ -518,16 +540,18 @@ impl AndroidDriver {
     }
 
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
+        debug!(target: "android_driver_rs::driver", "截取屏幕");
         self.screenshot_with_method(ScreenshotMethod::Auto).await
     }
     pub async fn screenshot_with_method(&self, method: ScreenshotMethod) -> Result<Vec<u8>> {
+        trace!(target: "android_driver_rs::driver", ?method, "截图（指定方式）");
         match method {
             ScreenshotMethod::AdbScreencap => self.adb_screenshot().await,
             ScreenshotMethod::U2 => self.u2_screenshot().await,
             ScreenshotMethod::Auto => match self.adb_screenshot().await {
                 Ok(bytes) => Ok(bytes),
                 Err(error) => {
-                    tracing::debug!(target: "android_driver_rs::screenshot", %error, "ADB 截图失败，回退 u2");
+                    debug!(target: "android_driver_rs::driver", %error, "ADB 截图失败，回退 u2");
                     self.u2_screenshot().await
                 }
             },
@@ -569,6 +593,7 @@ impl AndroidDriver {
     }
 
     pub async fn ui_tree_xml(&self) -> Result<String> {
+        trace!(target: "android_driver_rs::driver", "获取 UI 树 XML");
         let value = self
             .call_json_rpc("dumpWindowHierarchy", json!([false, 50]))
             .await?;
@@ -582,6 +607,7 @@ impl AndroidDriver {
     }
 
     pub async fn find(&self, selector: &Selector) -> Result<Option<Element>> {
+        trace!(target: "android_driver_rs::driver", ?selector, "查找元素");
         let exists = self
             .call_json_rpc("exist", json!([selector.value(0)]))
             .await?
@@ -624,6 +650,7 @@ impl AndroidDriver {
         }
     }
     pub async fn wait_for(&self, selector: &Selector, timeout: Duration) -> Result<Element> {
+        trace!(target: "android_driver_rs::driver", ?selector, ?timeout, "等待元素");
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(element) = self.find(selector).await? {
@@ -652,6 +679,7 @@ impl AndroidDriver {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<bool>>,
     {
+        trace!(target: "android_driver_rs::driver", ?timeout, "等待条件");
         let deadline = Instant::now() + timeout;
         loop {
             if condition().await? {
@@ -697,6 +725,7 @@ impl AndroidDriver {
 }
 
 async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
+    debug!(target: "android_driver_rs::driver", local = %local.display(), "部署 Agent JAR");
     adb.shell(["mkdir", "-p", REMOTE_DIR]).await?;
     let current = adb
         .shell(["sha256sum", REMOTE_JAR])
@@ -707,6 +736,7 @@ async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
         .as_deref()
         .is_some_and(|value| value.split_whitespace().next() == Some(agent::JAR_SHA256))
     {
+        debug!(target: "android_driver_rs::driver", "Agent JAR 已就绪，跳过部署");
         return Ok(());
     }
     let temporary = format!("{REMOTE_JAR}.{}.tmp", std::process::id());
@@ -727,10 +757,12 @@ async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
             "设备端 u2.jar SHA-256 不匹配".into(),
         ));
     }
+    info!(target: "android_driver_rs::driver", "Agent JAR 部署完成");
     Ok(())
 }
 
 async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<EstablishedSession> {
+    info!(target: "android_driver_rs::driver", "建立 RPC 会话");
     let compatible_process = compatible_agent_process(adb, DEFAULT_AGENT_PORT).await;
     let borrowed_forward = create_forward(adb, DEFAULT_AGENT_PORT).await?;
     if compatible_process && ping(borrowed_forward.local_port, adb.agent_timeout()).await {
@@ -788,6 +820,7 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
 }
 
 async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
+    debug!(target: "android_driver_rs::driver", remote_port = port, "启动自有 Agent");
     let classpath = format!("CLASSPATH={REMOTE_JAR}");
     let mut host_process = adb.spawn_long_running([
         "shell".to_owned(),
@@ -825,7 +858,7 @@ async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
 }
 
 async fn stop_owned_agent(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()> {
-    tracing::debug!(target: "android_driver_rs::agent", remote_port = agent.port, "停止自有 Agent");
+    debug!(target: "android_driver_rs::driver", remote_port = agent.port, "停止自有 Agent");
     let pid = agent.pid.to_string();
     let result = adb
         .shell(["kill", &pid])
@@ -896,6 +929,7 @@ async fn compatible_agent_process(adb: &AdbRunner, port: u16) -> bool {
 }
 
 async fn create_forward(adb: &AdbRunner, remote_port: u16) -> Result<OwnedForward> {
+    trace!(target: "android_driver_rs::driver", remote_port, "创建端口转发");
     let remote = format!("tcp:{remote_port}");
     let output = adb
         .run_text(["forward", "tcp:0", &remote], adb.agent_timeout())
@@ -912,6 +946,7 @@ async fn create_forward(adb: &AdbRunner, remote_port: u16) -> Result<OwnedForwar
 }
 
 async fn remove_forward(adb: &AdbRunner, forward: &OwnedForward) -> Result<()> {
+    trace!(target: "android_driver_rs::driver", local_port = forward.local_port, remote_port = forward.remote_port, "移除端口转发");
     let local = format!("tcp:{}", forward.local_port);
     adb.run_text(["forward", "--remove", &local], adb.agent_timeout())
         .await?;
@@ -935,6 +970,7 @@ async fn remove_forward(adb: &AdbRunner, forward: &OwnedForward) -> Result<()> {
 }
 
 async fn cleanup_resources(adb: &AdbRunner, state: &mut SessionState) -> Result<()> {
+    debug!(target: "android_driver_rs::driver", "清理资源");
     if let Some(agent) = state.owned_agent.as_mut() {
         stop_owned_agent(adb, agent).await?;
         state.owned_agent = None;
@@ -1000,6 +1036,7 @@ impl Drop for ImeGuard {
 }
 
 fn spawn_cleanup(future: impl Future<Output = ()> + Send + 'static) {
+    debug!(target: "android_driver_rs::driver", "生成后台清理任务");
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(future);
     } else {
@@ -1019,7 +1056,7 @@ fn spawn_cleanup(future: impl Future<Output = ()> + Send + 'static) {
 impl Drop for DriverInner {
     fn drop(&mut self) {
         let Ok(mut state) = self.state.try_lock() else {
-            tracing::warn!(target: "android_driver_rs::cleanup", "Driver 释放时会话仍被占用，无法兜底清理");
+            warn!(target: "android_driver_rs::driver", "Driver 释放时会话仍被占用，无法兜底清理");
             return;
         };
         if state.closed {

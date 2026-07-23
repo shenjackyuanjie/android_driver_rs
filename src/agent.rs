@@ -3,6 +3,7 @@
 use crate::{DriverError, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, trace, warn};
 
 pub(crate) const JAR_NAME: &str = "u2.jar";
 pub(crate) const APK_NAME: &str = "app-uiautomator.apk";
@@ -48,6 +49,7 @@ pub(crate) struct MaterializedAgent {
 }
 
 pub(crate) async fn materialize(source: &AgentSource) -> Result<MaterializedAgent> {
+    debug!(target: "android_driver_rs::agent", ?source, "物化 Agent");
     let files = match source {
         AgentSource::Directory(directory) => MaterializedAgent {
             jar: directory.join(JAR_NAME),
@@ -64,6 +66,7 @@ pub(crate) async fn materialize(source: &AgentSource) -> Result<MaterializedAgen
 
 #[cfg(feature = "embedded-agent")]
 async fn materialize_embedded() -> Result<MaterializedAgent> {
+    info!(target: "android_driver_rs::agent", "物化内嵌 Agent");
     static JAR: &[u8] = include_bytes!("../assets/u2.jar");
     static APK: &[u8] = include_bytes!("../assets/app-uiautomator.apk");
     let directory = std::env::temp_dir().join("android_driver_rs").join("0.1.0");
@@ -102,21 +105,26 @@ async fn write_atomic(directory: &Path, name: &str, bytes: &[u8]) -> Result<Path
 }
 
 async fn verify_jar(path: &Path) -> Result<()> {
+    trace!(target: "android_driver_rs::agent", path = %path.display(), "校验 Agent");
     if !path.is_file() {
+        warn!(target: "android_driver_rs::agent", path = %path.display(), "Agent 文件不存在");
         return Err(DriverError::AgentNotFound(path.to_owned()));
     }
     let bytes = tokio::fs::read(path).await?;
     if bytes.len() as u64 != JAR_SIZE {
+        warn!(target: "android_driver_rs::agent", expected = JAR_SIZE, actual = bytes.len(), "Agent 大小不匹配");
         return Err(DriverError::AgentVerification(format!(
             "u2.jar 大小应为 {JAR_SIZE} bytes"
         )));
     }
     let digest = format!("{:x}", Sha256::digest(&bytes));
     if digest != JAR_SHA256 {
+        warn!(target: "android_driver_rs::agent", "Agent SHA-256 不匹配");
         return Err(DriverError::AgentVerification(
             "u2.jar SHA-256 不匹配".into(),
         ));
     }
+    trace!(target: "android_driver_rs::agent", "Agent 验证通过");
     Ok(())
 }
 

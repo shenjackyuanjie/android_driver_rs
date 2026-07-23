@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::{debug, trace, warn};
 
 /// ADB CLI 配置。
 #[derive(Clone, Debug)]
@@ -102,6 +103,7 @@ impl AdbRunner {
     }
 
     pub async fn discover(&self) -> Result<Vec<DeviceDescriptor>> {
+        debug!(target: "android_driver_rs::adb", "发现设备");
         let output = self
             .run_text(["devices", "-l"], self.inner.config.command_timeout)
             .await?;
@@ -109,6 +111,7 @@ impl AdbRunner {
     }
 
     pub async fn select(&self, selector: &DeviceSelector) -> Result<DeviceDescriptor> {
+        debug!(target: "android_driver_rs::adb", ?selector, "选择设备");
         let devices = self.discover().await?;
         match selector {
             DeviceSelector::Auto => {
@@ -169,12 +172,16 @@ impl AdbRunner {
             command.arg("-s").arg(serial.expose_secret());
         }
         command.args(args);
-        tracing::debug!(target: "android_driver_rs::adb", "执行 ADB 命令");
+        trace!(target: "android_driver_rs::adb", command = ?command, "执行 ADB 命令");
         let child = command.spawn().map_err(DriverError::AdbSpawn)?;
-        let output = timeout(duration, child.wait_with_output())
-            .await
-            .map_err(|_| DriverError::AdbTimeout { timeout: duration })?
-            .map_err(DriverError::AdbSpawn)?;
+        let output = match timeout(duration, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return Err(DriverError::AdbSpawn(error)),
+            Err(_) => {
+                warn!(target: "android_driver_rs::adb", ?duration, "ADB 命令超时");
+                return Err(DriverError::AdbTimeout { timeout: duration });
+            }
+        };
         if !output.status.success() {
             let message = self.redact(String::from_utf8_lossy(&output.stderr).trim().to_owned());
             return Err(DriverError::AdbCommand {
@@ -206,6 +213,7 @@ impl AdbRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        trace!(target: "android_driver_rs::adb", "启动长期子进程");
         let mut command = Command::new(&self.inner.executable);
         command
             .kill_on_drop(true)
