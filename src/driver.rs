@@ -725,40 +725,130 @@ impl AndroidDriver {
 }
 
 async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
-    debug!(target: "android_driver_rs::driver", local = %local.display(), "部署 Agent JAR");
+    debug!(
+        target: "android_driver_rs::driver",
+        local = %local.display(),
+        expected_size = agent::JAR_SIZE,
+        expected_sha256 = agent::JAR_SHA256,
+        "部署 Agent JAR"
+    );
     adb.shell(["mkdir", "-p", REMOTE_DIR]).await?;
-    let current = adb
-        .shell(["sha256sum", REMOTE_JAR])
-        .await
-        .ok()
-        .map(|value| value.stdout);
-    if current
-        .as_deref()
-        .is_some_and(|value| value.split_whitespace().next() == Some(agent::JAR_SHA256))
-    {
-        debug!(target: "android_driver_rs::driver", "Agent JAR 已就绪，跳过部署");
-        return Ok(());
+    match inspect_remote_file(adb, REMOTE_JAR, "部署前").await {
+        Ok(current) if remote_digest_matches(&current) => {
+            debug!(target: "android_driver_rs::driver", "Agent JAR 已就绪，跳过部署");
+            return Ok(());
+        }
+        Ok(_) => {
+            debug!(target: "android_driver_rs::driver", "设备端现有 Agent JAR 不匹配，重新部署");
+        }
+        Err(error) => {
+            debug!(target: "android_driver_rs::driver", error = %error, "无法检查设备端现有 Agent JAR，继续部署");
+        }
     }
+
     let temporary = format!("{REMOTE_JAR}.{}.tmp", std::process::id());
-    adb.run_text(
-        [
-            OsString::from("push"),
-            local.as_os_str().to_os_string(),
-            OsString::from(&temporary),
-        ],
-        adb.transfer_timeout(),
-    )
-    .await?;
+    let push = adb
+        .run_text(
+            [
+                OsString::from("push"),
+                local.as_os_str().to_os_string(),
+                OsString::from(&temporary),
+            ],
+            adb.transfer_timeout(),
+        )
+        .await?;
+    debug!(
+        target: "android_driver_rs::driver",
+        remote = temporary,
+        stdout = ?push.stdout.trim(),
+        stderr = ?push.stderr.trim(),
+        "Agent JAR 推送完成"
+    );
+
     adb.shell(["chmod", "0644", &temporary]).await?;
+    let pushed = inspect_remote_file(adb, &temporary, "push 后").await?;
+    verify_remote_digest(&pushed, "临时")?;
+
     adb.shell(["mv", &temporary, REMOTE_JAR]).await?;
-    let digest = adb.shell(["sha256sum", REMOTE_JAR]).await?.stdout;
-    if digest.split_whitespace().next() != Some(agent::JAR_SHA256) {
-        return Err(DriverError::AgentVerification(
-            "设备端 u2.jar SHA-256 不匹配".into(),
-        ));
-    }
+    let published = inspect_remote_file(adb, REMOTE_JAR, "mv 后").await?;
+    verify_remote_digest(&published, "正式")?;
     info!(target: "android_driver_rs::driver", "Agent JAR 部署完成");
     Ok(())
+}
+
+struct RemoteFileInfo {
+    digest: Option<String>,
+    size: Option<u64>,
+}
+
+async fn inspect_remote_file(
+    adb: &AdbRunner,
+    remote: &str,
+    stage: &'static str,
+) -> Result<RemoteFileInfo> {
+    let sha256 = adb.shell(["sha256sum", remote]).await?;
+    let digest = parse_sha256_output(&sha256.stdout).map(str::to_owned);
+    let size = match adb.shell(["stat", "-c", "%s", remote]).await {
+        Ok(output) => output
+            .stdout
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse().ok()),
+        Err(error) => {
+            debug!(
+                target: "android_driver_rs::driver",
+                stage,
+                remote,
+                error = %error,
+                "无法获取设备端 Agent 文件大小"
+            );
+            None
+        }
+    };
+    debug!(
+        target: "android_driver_rs::driver",
+        stage,
+        remote,
+        expected_sha256 = agent::JAR_SHA256,
+        actual_sha256 = digest.as_deref().unwrap_or("<无法解析>"),
+        size = ?size,
+        sha256_stdout = ?sha256.stdout,
+        sha256_stderr = ?sha256.stderr,
+        "设备端 Agent 文件信息"
+    );
+    Ok(RemoteFileInfo { digest, size })
+}
+
+fn parse_sha256_output(output: &str) -> Option<&str> {
+    output
+        .split_whitespace()
+        .find(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn remote_digest_matches(info: &RemoteFileInfo) -> bool {
+    info.digest
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(agent::JAR_SHA256))
+}
+
+fn verify_remote_digest(info: &RemoteFileInfo, kind: &str) -> Result<()> {
+    if remote_digest_matches(info) {
+        return Ok(());
+    }
+    let actual = info.digest.as_deref().unwrap_or("<无法解析>");
+    warn!(
+        target: "android_driver_rs::driver",
+        kind,
+        expected_sha256 = agent::JAR_SHA256,
+        actual_sha256 = actual,
+        size = ?info.size,
+        "设备端 Agent JAR 校验失败"
+    );
+    Err(DriverError::AgentVerification(format!(
+        "设备端{kind} u2.jar SHA-256 不匹配（expected={}, actual={actual}, size={:?}）",
+        agent::JAR_SHA256,
+        info.size
+    )))
 }
 
 async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<EstablishedSession> {
@@ -1133,5 +1223,19 @@ mod tests {
         assert!(validate_image(b"\x89PNG\r\n\x1a\nrest".to_vec()).is_ok());
         assert!(validate_image(b"\xff\xd8\xffrest".to_vec()).is_ok());
         assert!(validate_image(b"bad".to_vec()).is_err());
+    }
+
+    #[test]
+    fn parses_common_sha256_output_formats() {
+        let gnu = format!("{}  /data/local/tmp/u2.jar\n", agent::JAR_SHA256);
+        assert_eq!(parse_sha256_output(&gnu), Some(agent::JAR_SHA256));
+
+        let uppercase = agent::JAR_SHA256.to_ascii_uppercase();
+        let bsd = format!("SHA256 (/data/local/tmp/u2.jar) = {uppercase}\r\n");
+        assert_eq!(parse_sha256_output(&bsd), Some(uppercase.as_str()));
+        assert!(remote_digest_matches(&RemoteFileInfo {
+            digest: Some(uppercase),
+            size: Some(agent::JAR_SIZE),
+        }));
     }
 }

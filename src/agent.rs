@@ -3,7 +3,12 @@
 use crate::{DriverError, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
+
+static MATERIALIZE_LOCK: Mutex<()> = Mutex::const_new(());
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const JAR_NAME: &str = "u2.jar";
 pub(crate) const APK_NAME: &str = "app-uiautomator.apk";
@@ -87,21 +92,61 @@ async fn materialize_embedded() -> Result<MaterializedAgent> {
 }
 
 async fn write_atomic(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let _guard = MATERIALIZE_LOCK.lock().await;
     let target = directory.join(name);
-    if tokio::fs::metadata(&target)
-        .await
-        .map(|value| value.len() == bytes.len() as u64)
-        .unwrap_or(false)
-    {
+    if file_matches(&target, bytes).await {
+        trace!(target: "android_driver_rs::agent", path = %target.display(), "复用已物化的 Agent 文件");
         return Ok(target);
     }
-    let temporary = directory.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
     tokio::fs::write(&temporary, bytes).await?;
-    if tokio::fs::rename(&temporary, &target).await.is_err() {
-        let _ = tokio::fs::remove_file(&target).await;
-        tokio::fs::rename(&temporary, &target).await?;
+
+    if let Err(first_error) = tokio::fs::rename(&temporary, &target).await {
+        if file_matches(&target, bytes).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Ok(target);
+        }
+        debug!(
+            target: "android_driver_rs::agent",
+            path = %target.display(),
+            error = %first_error,
+            "原子替换 Agent 文件失败，清理旧文件后重试"
+        );
+        match tokio::fs::remove_file(&target).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &target).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
     }
+
+    debug!(
+        target: "android_driver_rs::agent",
+        path = %target.display(),
+        size = bytes.len(),
+        "Agent 文件物化完成"
+    );
     Ok(target)
+}
+
+async fn file_matches(path: &Path, expected: &[u8]) -> bool {
+    let matches_size = tokio::fs::metadata(path)
+        .await
+        .map(|value| value.len() == expected.len() as u64)
+        .unwrap_or(false);
+    matches_size
+        && tokio::fs::read(path)
+            .await
+            .map(|actual| actual == expected)
+            .unwrap_or(false)
 }
 
 async fn verify_jar(path: &Path) -> Result<()> {
@@ -140,5 +185,39 @@ mod tests {
             tokio::fs::metadata(files.jar).await.unwrap().len(),
             JAR_SIZE
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_atomic_writes_publish_complete_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![0x5a; 1024 * 1024];
+        let (first, second, third) = tokio::join!(
+            write_atomic(directory.path(), "agent.bin", &bytes),
+            write_atomic(directory.path(), "agent.bin", &bytes),
+            write_atomic(directory.path(), "agent.bin", &bytes),
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(directory.path().join("agent.bin"))
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_write_repairs_same_size_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("agent.bin");
+        tokio::fs::write(&target, b"broken").await.unwrap();
+
+        write_atomic(directory.path(), "agent.bin", b"intact")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"intact");
     }
 }
