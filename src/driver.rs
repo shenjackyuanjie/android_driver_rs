@@ -995,6 +995,7 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
 
 async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
     debug!(target: "android_driver_rs::driver", remote_port = port, "启动自有 Agent");
+    let existing_app_processes = app_process_pids(adb).await;
     let classpath = format!("CLASSPATH={REMOTE_JAR}");
     let mut host_process = adb.spawn_long_running([
         "shell".to_owned(),
@@ -1009,6 +1010,22 @@ async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
     let deadline = Instant::now() + adb.agent_timeout();
     loop {
         if let Some(pid) = agent_pid(adb, port).await {
+            return Ok(OwnedAgent {
+                pid,
+                port,
+                host_process,
+                capture,
+            });
+        }
+        if remote_port_in_use(adb, port).await
+            && let Some(pid) = new_app_process_pid(adb, &existing_app_processes).await
+        {
+            debug!(
+                target: "android_driver_rs::driver",
+                remote_port = port,
+                pid,
+                "通过监听端口和新增 app_process 识别 Android 6 Agent"
+            );
             return Ok(OwnedAgent {
                 pid,
                 port,
@@ -1301,6 +1318,53 @@ async fn agent_pid(adb: &AdbRunner, port: u16) -> Option<u32> {
         .stdout
         .lines()
         .find_map(|line| parse_agent_pid_line(line, &port))
+}
+
+async fn app_process_pids(adb: &AdbRunner) -> Vec<u32> {
+    for output in [
+        adb.shell(["ps", "-A", "-o", "PID,ARGS"]).await.ok(),
+        adb.shell(["ps", "-A"]).await.ok(),
+        adb.shell(["ps"]).await.ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let pids = output
+            .stdout
+            .lines()
+            .filter_map(parse_app_process_pid_line)
+            .collect::<Vec<_>>();
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    Vec::new()
+}
+
+async fn new_app_process_pid(adb: &AdbRunner, existing: &[u32]) -> Option<u32> {
+    let mut candidates = app_process_pids(adb)
+        .await
+        .into_iter()
+        .filter(|pid| !existing.contains(pid));
+    let pid = candidates.next()?;
+    candidates.next().is_none().then_some(pid)
+}
+
+fn parse_app_process_pid_line(line: &str) -> Option<u32> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let pid_index = fields
+        .iter()
+        .position(|field| field.parse::<u32>().is_ok())?;
+    fields[pid_index + 1..]
+        .iter()
+        .any(|field| {
+            matches!(
+                field.rsplit('/').next(),
+                Some("app_process" | "app_process32" | "app_process64")
+            )
+        })
+        .then(|| fields[pid_index].parse().ok())
+        .flatten()
 }
 
 fn parse_agent_pid_line(line: &str, port: &str) -> Option<u32> {
