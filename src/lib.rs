@@ -18,7 +18,7 @@ pub mod blocking;
 
 pub use adb::{AdbConfig, CommandOutput};
 pub use agent::{AgentProfile, AgentSource};
-pub use driver::{AndroidDriver, AndroidDriverBuilder, DriverConfig};
+pub use driver::{AndroidDriver, AndroidDriverBuilder, DriverConfig, UiAutomationConflictPolicy};
 pub use error::{DriverError, Result};
 pub use selector::{Element, MatchPattern, Selector};
 pub use types::{

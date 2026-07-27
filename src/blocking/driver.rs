@@ -3,7 +3,7 @@ use crate::{
     ActivityName, AdbConfig, AgentProfile, AgentSource, AndroidDriver as AsyncDriver,
     AndroidDriverBuilder as AsyncBuilder, AndroidKeyCode, AppIdentifier, DeviceDescriptor,
     DeviceInfo, DeviceSelector, DisplaySize, DriverConfig, Point, Position, Result, ScreenState,
-    ScreenshotMethod, Selector, UiNode,
+    ScreenshotMethod, Selector, UiAutomationConflictPolicy, UiNode,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,10 @@ impl AndroidDriverBuilder {
     }
     pub fn driver_config(mut self, value: DriverConfig) -> Self {
         self.inner = self.inner.driver_config(value);
+        self
+    }
+    pub fn ui_automation_conflict_policy(mut self, value: UiAutomationConflictPolicy) -> Self {
+        self.inner = self.inner.ui_automation_conflict_policy(value);
         self
     }
     pub fn connect(self) -> Result<AndroidDriver> {

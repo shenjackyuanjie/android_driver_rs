@@ -29,6 +29,7 @@ pub struct DriverConfig {
     pub rpc_timeout: Duration,
     pub max_json_size: usize,
     pub wait_interval: Duration,
+    pub ui_automation_conflict_policy: UiAutomationConflictPolicy,
 }
 
 impl Default for DriverConfig {
@@ -37,8 +38,19 @@ impl Default for DriverConfig {
             rpc_timeout: Duration::from_secs(20),
             max_json_size: 8 * 1024 * 1024,
             wait_interval: Duration::from_millis(500),
+            ui_automation_conflict_policy: UiAutomationConflictPolicy::Fail,
         }
     }
+}
+
+/// 设备已有 UiAutomation 服务时的处理策略。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiAutomationConflictPolicy {
+    /// 不触碰外部自动化进程，返回可诊断的启动错误。
+    #[default]
+    Fail,
+    /// 清理精确识别为 `uiautomator` 的外部进程后再启动 Agent。
+    KillStaleProcesses,
 }
 
 /// 异步 Driver Builder。
@@ -73,6 +85,10 @@ impl AndroidDriverBuilder {
     }
     pub fn driver_config(mut self, config: DriverConfig) -> Self {
         self.config = config;
+        self
+    }
+    pub fn ui_automation_conflict_policy(mut self, policy: UiAutomationConflictPolicy) -> Self {
+        self.config.ui_automation_conflict_policy = policy;
         self
     }
 
@@ -912,14 +928,28 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
         });
     }
     remove_forward(adb, &borrowed_forward).await?;
+    resolve_uiautomation_conflict(adb, config.ui_automation_conflict_policy).await?;
 
+    let mut startup_errors = Vec::new();
     for port in OWNED_AGENT_PORTS {
         if remote_port_in_use(adb, port).await {
             continue;
         }
         let mut owned_agent = match start_agent(adb, port).await {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(error) => {
+                warn!(
+                    target: "android_driver_rs::driver",
+                    remote_port = port,
+                    error = %error,
+                    "Agent 启动尝试失败"
+                );
+                if is_uiautomation_conflict_message(&error.to_string()) {
+                    return Err(error);
+                }
+                startup_errors.push(format!("tcp:{port}: {error}"));
+                continue;
+            }
         };
         let forward = match create_forward(adb, port).await {
             Ok(value) => value,
@@ -949,46 +979,148 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
         let _ = remove_forward(adb, &forward).await;
         let _ = stop_owned_agent(adb, &mut owned_agent).await;
     }
-    Err(DriverError::AgentStartup(
-        "9008 不可借用，且 19008..=19017 均无法启动 Agent".into(),
-    ))
+    let detail = if startup_errors.is_empty() {
+        "候选端口均已被占用".to_owned()
+    } else {
+        startup_errors.join("；")
+    };
+    Err(DriverError::AgentStartup(format!(
+        "9008 不可借用，且 19008..=19017 均无法启动 Agent：{detail}"
+    )))
 }
 
 async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
     debug!(target: "android_driver_rs::driver", remote_port = port, "启动自有 Agent");
-    let classpath = format!("CLASSPATH={REMOTE_JAR}");
+    let log = agent_log_path(port);
+    let command =
+        format!("CLASSPATH={REMOTE_JAR} app_process / com.wetest.uia2.Main -p {port} > {log} 2>&1");
     let mut host_process = adb.spawn_long_running([
         "shell".to_owned(),
-        classpath,
-        "app_process".to_owned(),
-        "/".to_owned(),
-        "com.wetest.uia2.Main".to_owned(),
-        "-p".to_owned(),
-        port.to_string(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        command,
     ])?;
     let deadline = Instant::now() + adb.agent_timeout();
     loop {
         if let Some(pid) = agent_pid(adb, port).await {
+            let _ = adb.shell(["rm", "-f", &log]).await;
             return Ok(OwnedAgent {
                 pid,
                 port,
                 host_process,
             });
         }
-        if host_process
-            .try_wait()
-            .map_err(DriverError::AdbSpawn)?
-            .is_some()
-        {
-            return Err(DriverError::AgentStartup(
-                "Agent 子进程在监听端口前退出".into(),
-            ));
+        if let Some(status) = host_process.try_wait().map_err(DriverError::AdbSpawn)? {
+            return Err(agent_startup_failure(
+                adb,
+                port,
+                &log,
+                format!("Agent 子进程在监听端口前退出（status={status:?}）"),
+            )
+            .await);
         }
         if Instant::now() >= deadline {
             let _ = host_process.kill().await;
-            return Err(DriverError::AgentStartup("等待 Agent PID 超时".into()));
+            return Err(agent_startup_failure(adb, port, &log, "等待 Agent PID 超时").await);
         }
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn agent_log_path(port: u16) -> String {
+    format!("{REMOTE_DIR}/agent-{port}.log")
+}
+
+async fn agent_startup_failure(
+    adb: &AdbRunner,
+    port: u16,
+    log: &str,
+    reason: impl Into<String>,
+) -> DriverError {
+    let diagnostic = adb
+        .shell(["cat", log])
+        .await
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    let _ = adb.shell(["rm", "-f", log]).await;
+    let diagnostic = truncate_agent_diagnostic(&diagnostic);
+    let reason = reason.into();
+    let message = if is_uiautomation_conflict_message(&diagnostic) {
+        format!(
+            "UiAutomationService already registered：设备上的 UiAutomation 被其他进程占用（port={port}）；{diagnostic}"
+        )
+    } else if diagnostic.is_empty() {
+        format!("{reason}（port={port}；设备端没有返回启动输出）")
+    } else {
+        format!("{reason}（port={port}；设备端输出：{diagnostic}）")
+    };
+    DriverError::AgentStartup(message)
+}
+
+fn truncate_agent_diagnostic(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    const LIMIT: usize = 8192;
+    if value.chars().count() <= LIMIT {
+        value.to_owned()
+    } else {
+        format!(
+            "{}...[truncated]",
+            value.chars().take(LIMIT).collect::<String>()
+        )
+    }
+}
+
+fn is_uiautomation_conflict_message(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("uiautomationservice")
+        && (normalized.contains("already registered")
+            || normalized.contains("already_registered")
+            || normalized.contains("已被"))
+}
+
+async fn resolve_uiautomation_conflict(
+    adb: &AdbRunner,
+    policy: UiAutomationConflictPolicy,
+) -> Result<()> {
+    let pids = uiautomator_pids(adb).await;
+    if pids.is_empty() {
+        return Ok(());
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match policy {
+        UiAutomationConflictPolicy::Fail => Err(DriverError::AgentStartup(format!(
+            "设备上的 UiAutomation 已被外部 uiautomator 进程占用（PID: {list}）；\
+             请停止该进程后重试，或显式启用 KillStaleProcesses 策略"
+        ))),
+        UiAutomationConflictPolicy::KillStaleProcesses => {
+            for pid in &pids {
+                let pid = pid.to_string();
+                adb.shell(["kill", &pid]).await.map_err(|error| {
+                    DriverError::AgentStartup(format!(
+                        "无法清理 uiautomator 进程 PID {pid}：{error}"
+                    ))
+                })?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if uiautomator_pids(adb).await.is_empty() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(DriverError::AgentStartup(format!(
+                        "已请求清理 uiautomator 进程，但 PID {list} 仍在运行"
+                    )));
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
@@ -1009,6 +1141,61 @@ async fn stop_owned_agent(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()>
         .map(|_| ());
     let _ = agent.host_process.kill().await;
     result
+}
+
+async fn uiautomator_pids(adb: &AdbRunner) -> Vec<u32> {
+    for output in [
+        adb.shell(["ps", "-A", "-o", "PID,ARGS"]).await.ok(),
+        adb.shell(["ps", "-A"]).await.ok(),
+        adb.shell(["ps"]).await.ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let pids = output
+            .stdout
+            .lines()
+            .filter_map(parse_uiautomator_pid_line)
+            .collect::<Vec<_>>();
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+
+    let proc_listing = r#"for path in /proc/[0-9]*/cmdline; do pid=${path#/proc/}; pid=${pid%/cmdline}; cmdline=$(tr '\0' ' ' < "$path" 2>/dev/null); case "$cmdline" in uiautomator|uiautomator\ *|*/uiautomator|*/uiautomator\ *) echo "$pid $cmdline";; esac; done"#;
+    adb.shell(["sh", "-c", proc_listing])
+        .await
+        .map(|output| {
+            output
+                .stdout
+                .lines()
+                .filter_map(parse_uiautomator_pid_line)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_uiautomator_pid_line(line: &str) -> Option<u32> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let pid_index = fields
+        .iter()
+        .position(|field| field.parse::<u32>().is_ok())?;
+    let command = &fields[pid_index + 1..];
+    if command
+        .iter()
+        .any(|field| field.contains("com.wetest.uia2.Main"))
+    {
+        return None;
+    }
+    command
+        .iter()
+        .any(|field| {
+            *field == "uiautomator"
+                || field.ends_with("/uiautomator")
+                || field.starts_with("uiautomator:")
+        })
+        .then(|| fields[pid_index].parse().ok())
+        .flatten()
 }
 
 async fn agent_pid(adb: &AdbRunner, port: u16) -> Option<u32> {
