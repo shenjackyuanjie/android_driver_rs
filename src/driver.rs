@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Child;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tracing::{debug, info, trace, warn};
 
@@ -166,6 +169,7 @@ struct OwnedAgent {
     pid: u32,
     port: u16,
     host_process: tokio::process::Child,
+    capture: AgentCapture,
 }
 struct EstablishedSession {
     rpc: RpcClient,
@@ -991,58 +995,49 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
 
 async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
     debug!(target: "android_driver_rs::driver", remote_port = port, "启动自有 Agent");
-    let log = agent_log_path(port);
-    let command =
-        format!("CLASSPATH={REMOTE_JAR} app_process / com.wetest.uia2.Main -p {port} > {log} 2>&1");
+    let classpath = format!("CLASSPATH={REMOTE_JAR}");
     let mut host_process = adb.spawn_long_running([
         "shell".to_owned(),
-        "sh".to_owned(),
-        "-c".to_owned(),
-        command,
+        classpath,
+        "app_process".to_owned(),
+        "/".to_owned(),
+        "com.wetest.uia2.Main".to_owned(),
+        "-p".to_owned(),
+        port.to_string(),
     ])?;
+    let capture = AgentCapture::attach(&mut host_process)?;
     let deadline = Instant::now() + adb.agent_timeout();
     loop {
         if let Some(pid) = agent_pid(adb, port).await {
-            let _ = adb.shell(["rm", "-f", &log]).await;
             return Ok(OwnedAgent {
                 pid,
                 port,
                 host_process,
+                capture,
             });
         }
         if let Some(status) = host_process.try_wait().map_err(DriverError::AdbSpawn)? {
             return Err(agent_startup_failure(
-                adb,
                 port,
-                &log,
                 format!("Agent 子进程在监听端口前退出（status={status:?}）"),
+                capture,
             )
             .await);
         }
         if Instant::now() >= deadline {
             let _ = host_process.kill().await;
-            return Err(agent_startup_failure(adb, port, &log, "等待 Agent PID 超时").await);
+            return Err(agent_startup_failure(port, "等待 Agent PID 超时", capture).await);
         }
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn agent_log_path(port: u16) -> String {
-    format!("{REMOTE_DIR}/agent-{port}.log")
-}
-
 async fn agent_startup_failure(
-    adb: &AdbRunner,
     port: u16,
-    log: &str,
     reason: impl Into<String>,
+    capture: AgentCapture,
 ) -> DriverError {
-    let diagnostic = adb
-        .shell(["cat", log])
-        .await
-        .map(|output| output.stdout)
-        .unwrap_or_default();
-    let _ = adb.shell(["rm", "-f", log]).await;
+    let diagnostic = capture.finish().await;
     let diagnostic = truncate_agent_diagnostic(&diagnostic);
     let reason = reason.into();
     let message = if is_uiautomation_conflict_message(&diagnostic) {
@@ -1055,6 +1050,79 @@ async fn agent_startup_failure(
         format!("{reason}（port={port}；设备端输出：{diagnostic}）")
     };
     DriverError::AgentStartup(message)
+}
+
+struct AgentCapture {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl AgentCapture {
+    fn attach(child: &mut Child) -> Result<Self> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DriverError::AgentStartup("无法捕获 Agent stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| DriverError::AgentStartup("无法捕获 Agent stderr".into()))?;
+        let stdout_sink = Arc::new(Mutex::new(Vec::new()));
+        let stderr_sink = Arc::new(Mutex::new(Vec::new()));
+        let readers = vec![
+            spawn_agent_reader(stdout, Arc::clone(&stdout_sink)),
+            spawn_agent_reader(stderr, Arc::clone(&stderr_sink)),
+        ];
+        Ok(Self {
+            stdout: stdout_sink,
+            stderr: stderr_sink,
+            readers,
+        })
+    }
+
+    async fn finish(mut self) -> String {
+        for reader in self.readers.drain(..) {
+            let _ = reader.await;
+        }
+        let stdout = String::from_utf8_lossy(&self.stdout.lock().await).into_owned();
+        let stderr = String::from_utf8_lossy(&self.stderr.lock().await).into_owned();
+        match (stdout.trim(), stderr.trim()) {
+            ("", "") => String::new(),
+            (stdout, "") => format!("stdout: {stdout}"),
+            ("", stderr) => format!("stderr: {stderr}"),
+            (stdout, stderr) => format!("stdout: {stdout}; stderr: {stderr}"),
+        }
+    }
+
+    fn abort(&mut self) {
+        for reader in &self.readers {
+            reader.abort();
+        }
+        self.readers.clear();
+    }
+}
+
+fn spawn_agent_reader<R>(mut reader: R, sink: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(size) => {
+                    let mut output = sink.lock().await;
+                    output.extend_from_slice(&buffer[..size]);
+                    if output.len() > 8192 {
+                        let excess = output.len() - 8192;
+                        output.drain(..excess);
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn truncate_agent_diagnostic(value: &str) -> String {
@@ -1139,6 +1207,7 @@ async fn stop_owned_agent(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()>
             value => Err(value),
         })
         .map(|_| ());
+    agent.capture.abort();
     let _ = agent.host_process.kill().await;
     result
 }

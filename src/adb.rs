@@ -217,8 +217,8 @@ impl AdbRunner {
         let mut command = Command::new(&self.inner.executable);
         command
             .kill_on_drop(true)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some((host, port)) = &self.inner.server {
             command.arg("-H").arg(host).arg("-P").arg(port.to_string());
         }
