@@ -104,6 +104,10 @@ impl AndroidDriver {
         trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::unlock");
         block_on(self.inner.unlock())?
     }
+    pub fn mute_media(&self) -> Result<()> {
+        trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::mute_media");
+        block_on(self.inner.mute_media())?
+    }
     pub fn press_key(&self, key: impl Into<AndroidKeyCode>) -> Result<()> {
         trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::press_key");
         block_on(self.inner.press_key(key))?

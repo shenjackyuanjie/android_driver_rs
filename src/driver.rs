@@ -322,6 +322,61 @@ impl AndroidDriver {
             .map(|_| ())
     }
 
+    /// 将媒体流音量设置为零。
+    pub async fn mute_media(&self) -> Result<()> {
+        debug!(target: "android_driver_rs::driver", "静音媒体流");
+        let sdk_level = self
+            .property("ro.build.version.sdk")
+            .await?
+            .parse::<u32>()
+            .map_err(|_| DriverError::Protocol("SDK 版本无效".into()))?;
+        if sdk_level > 23
+            && self
+                .inner
+                .adb
+                .shell([
+                    "cmd",
+                    "media_session",
+                    "volume",
+                    "--stream",
+                    "3",
+                    "--set",
+                    "0",
+                ])
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+
+        let output = self
+            .inner
+            .adb
+            .shell([
+                "service",
+                "call",
+                "audio",
+                "3",
+                "i32",
+                "3",
+                "i32",
+                "0",
+                "i32",
+                "0",
+                "s16",
+                "com.android.shell",
+            ])
+            .await?;
+        let diagnostic = format!("{}\n{}", output.stdout, output.stderr);
+        if diagnostic.to_ascii_lowercase().contains("exception") {
+            return Err(DriverError::AdbCommand {
+                code: Some(output.status),
+                message: diagnostic.trim().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn press_key(&self, key: impl Into<AndroidKeyCode>) -> Result<()> {
         let code = key.into().0;
         trace!(target: "android_driver_rs::driver", key_code = code, "按键");
