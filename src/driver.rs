@@ -734,7 +734,7 @@ async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
     );
     adb.shell(["mkdir", "-p", REMOTE_DIR]).await?;
     match inspect_remote_file(adb, REMOTE_JAR, "部署前").await {
-        Ok(current) if remote_digest_matches(&current) => {
+        Ok(current) if remote_file_matches(&current) => {
             debug!(target: "android_driver_rs::driver", "Agent JAR 已就绪，跳过部署");
             return Ok(());
         }
@@ -779,6 +779,7 @@ async fn deploy_jar(adb: &AdbRunner, local: &Path) -> Result<()> {
 struct RemoteFileInfo {
     digest: Option<String>,
     size: Option<u64>,
+    exists: bool,
 }
 
 async fn inspect_remote_file(
@@ -786,8 +787,23 @@ async fn inspect_remote_file(
     remote: &str,
     stage: &'static str,
 ) -> Result<RemoteFileInfo> {
-    let sha256 = adb.shell(["sha256sum", remote]).await?;
-    let digest = parse_sha256_output(&sha256.stdout).map(str::to_owned);
+    let (digest, sha256_stdout, sha256_stderr) = match adb.shell(["sha256sum", remote]).await {
+        Ok(output) => (
+            parse_sha256_output(&output.stdout).map(str::to_owned),
+            output.stdout,
+            output.stderr,
+        ),
+        Err(error) => {
+            debug!(
+                target: "android_driver_rs::driver",
+                stage,
+                remote,
+                error = %error,
+                "设备端不支持 sha256sum，降级使用文件大小校验"
+            );
+            (None, String::new(), String::new())
+        }
+    };
     let size = match adb.shell(["stat", "-c", "%s", remote]).await {
         Ok(output) => output
             .stdout
@@ -802,9 +818,18 @@ async fn inspect_remote_file(
                 error = %error,
                 "无法获取设备端 Agent 文件大小"
             );
-            None
+            match adb.shell(["wc", "-c", remote]).await {
+                Ok(output) => output
+                    .stdout
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse().ok()),
+                Err(_) => None,
+            }
         }
     };
+    let exists =
+        digest.is_some() || size.is_some() || adb.shell(["test", "-f", remote]).await.is_ok();
     debug!(
         target: "android_driver_rs::driver",
         stage,
@@ -812,11 +837,16 @@ async fn inspect_remote_file(
         expected_sha256 = agent::JAR_SHA256,
         actual_sha256 = digest.as_deref().unwrap_or("<无法解析>"),
         size = ?size,
-        sha256_stdout = ?sha256.stdout,
-        sha256_stderr = ?sha256.stderr,
+        sha256_stdout = ?sha256_stdout,
+        sha256_stderr = ?sha256_stderr,
+        exists,
         "设备端 Agent 文件信息"
     );
-    Ok(RemoteFileInfo { digest, size })
+    Ok(RemoteFileInfo {
+        digest,
+        size,
+        exists,
+    })
 }
 
 fn parse_sha256_output(output: &str) -> Option<&str> {
@@ -831,8 +861,22 @@ fn remote_digest_matches(info: &RemoteFileInfo) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(agent::JAR_SHA256))
 }
 
+fn remote_file_matches(info: &RemoteFileInfo) -> bool {
+    remote_digest_matches(info)
+        || (info.exists && info.digest.is_none() && info.size == Some(agent::JAR_SIZE))
+}
+
 fn verify_remote_digest(info: &RemoteFileInfo, kind: &str) -> Result<()> {
     if remote_digest_matches(info) {
+        return Ok(());
+    }
+    if remote_file_matches(info) {
+        warn!(
+            target: "android_driver_rs::driver",
+            kind,
+            expected_size = agent::JAR_SIZE,
+            "设备端不支持 SHA-256，已降级为文件大小校验"
+        );
         return Ok(());
     }
     let actual = info.digest.as_deref().unwrap_or("<无法解析>");
@@ -845,9 +889,10 @@ fn verify_remote_digest(info: &RemoteFileInfo, kind: &str) -> Result<()> {
         "设备端 Agent JAR 校验失败"
     );
     Err(DriverError::AgentVerification(format!(
-        "设备端{kind} u2.jar SHA-256 不匹配（expected={}, actual={actual}, size={:?}）",
+        "设备端{kind} u2.jar 校验失败（expected_sha256={}, actual={actual}, size={:?}, exists={}）",
         agent::JAR_SHA256,
-        info.size
+        info.size,
+        info.exists
     )))
 }
 
@@ -967,12 +1012,57 @@ async fn stop_owned_agent(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()>
 }
 
 async fn agent_pid(adb: &AdbRunner, port: u16) -> Option<u32> {
-    let processes = adb.shell(["ps", "-A", "-o", "PID,ARGS"]).await.ok()?;
-    processes.stdout.lines().find_map(|line| {
-        (line.contains("com.wetest.uia2.Main") && line.contains(&format!("-p {port}")))
-            .then(|| line.split_whitespace().next()?.parse().ok())
-            .flatten()
-    })
+    let port = port.to_string();
+    if let Ok(output) = adb.shell(["ps", "-A", "-o", "PID,ARGS"]).await
+        && let Some(pid) = output
+            .stdout
+            .lines()
+            .find_map(|line| parse_agent_pid_line(line, &port))
+    {
+        return Some(pid);
+    }
+    if let Ok(output) = adb.shell(["ps", "-A"]).await
+        && let Some(pid) = output
+            .stdout
+            .lines()
+            .find_map(|line| parse_agent_pid_line(line, &port))
+    {
+        return Some(pid);
+    }
+    if let Ok(output) = adb.shell(["ps"]).await
+        && let Some(pid) = output
+            .stdout
+            .lines()
+            .find_map(|line| parse_agent_pid_line(line, &port))
+    {
+        return Some(pid);
+    }
+
+    let proc_listing = r#"for path in /proc/[0-9]*/cmdline; do pid=${path#/proc/}; pid=${pid%/cmdline}; cmdline=$(tr '\0' ' ' < "$path" 2>/dev/null); case "$cmdline" in *com.wetest.uia2.Main*) echo "$pid $cmdline";; esac; done"#;
+    adb.shell(["sh", "-c", proc_listing])
+        .await
+        .ok()?
+        .stdout
+        .lines()
+        .find_map(|line| parse_agent_pid_line(line, &port))
+}
+
+fn parse_agent_pid_line(line: &str, port: &str) -> Option<u32> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let command_start = fields
+        .iter()
+        .position(|field| field.contains("com.wetest.uia2.Main"))?;
+    let command = &fields[command_start..];
+    let has_port = command
+        .windows(2)
+        .any(|pair| pair[0] == "-p" && pair[1] == port)
+        || command.contains(&port);
+    if !has_port {
+        return None;
+    }
+    fields[..command_start]
+        .iter()
+        .find_map(|field| field.parse::<u32>().ok())
 }
 
 async fn remote_port_in_use(adb: &AdbRunner, port: u16) -> bool {
@@ -991,31 +1081,29 @@ async fn remote_port_in_use(adb: &AdbRunner, port: u16) -> bool {
 }
 
 async fn compatible_agent_process(adb: &AdbRunner, port: u16) -> bool {
-    let Ok(processes) = adb.shell(["ps", "-A", "-o", "PID,ARGS"]).await else {
+    let Some(pid) = agent_pid(adb, port).await else {
         return false;
     };
-    for line in processes.stdout.lines() {
-        if !line.contains("com.wetest.uia2.Main") || !line.contains(&port.to_string()) {
-            continue;
-        }
-        let Some(pid) = line
-            .split_whitespace()
-            .next()
-            .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
-        else {
-            continue;
-        };
-        let command = format!("tr '\\0' '\\n' </proc/{pid}/environ");
-        if adb.shell(["sh", "-c", &command]).await.is_ok_and(|output| {
-            output
-                .stdout
-                .lines()
-                .any(|value| value == format!("CLASSPATH={REMOTE_JAR}"))
-        }) {
-            return true;
+    let command = format!("tr '\\0' '\\n' </proc/{pid}/environ");
+    match adb.shell(["sh", "-c", &command]).await {
+        Ok(output) => output.stdout.lines().any(classpath_matches),
+        Err(error) => {
+            warn!(
+                target: "android_driver_rs::driver",
+                pid,
+                port,
+                error = %error,
+                "无法读取 Agent 进程环境，按目标命令行尝试复用"
+            );
+            true
         }
     }
-    false
+}
+
+fn classpath_matches(value: &str) -> bool {
+    value
+        .strip_prefix("CLASSPATH=")
+        .is_some_and(|classpath| classpath.split(':').any(|entry| entry == REMOTE_JAR))
 }
 
 async fn create_forward(adb: &AdbRunner, remote_port: u16) -> Result<OwnedForward> {
@@ -1236,6 +1324,45 @@ mod tests {
         assert!(remote_digest_matches(&RemoteFileInfo {
             digest: Some(uppercase),
             size: Some(agent::JAR_SIZE),
+            exists: true,
         }));
+        assert!(remote_file_matches(&RemoteFileInfo {
+            digest: None,
+            size: Some(agent::JAR_SIZE),
+            exists: true,
+        }));
+        assert!(!remote_file_matches(&RemoteFileInfo {
+            digest: None,
+            size: Some(agent::JAR_SIZE - 1),
+            exists: true,
+        }));
+    }
+
+    #[test]
+    fn parses_legacy_ps_rows_and_proc_rows() {
+        assert_eq!(
+            parse_agent_pid_line(
+                "u0_a123 4321 88 123456 45678 ffffffff 00000000 S com.wetest.uia2.Main -p 19008",
+                "19008"
+            ),
+            Some(4321)
+        );
+        assert_eq!(
+            parse_agent_pid_line("4321 com.wetest.uia2.Main -p 19008", "19008"),
+            Some(4321)
+        );
+        assert_eq!(
+            parse_agent_pid_line("4321 com.wetest.uia2.Main -p 9008", "19008"),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_classpath_variants() {
+        assert!(classpath_matches(&format!("CLASSPATH={REMOTE_JAR}")));
+        assert!(classpath_matches(&format!(
+            "CLASSPATH=/system/framework/foo.jar:{REMOTE_JAR}:"
+        )));
+        assert!(!classpath_matches("PATH=/system/bin"));
     }
 }
