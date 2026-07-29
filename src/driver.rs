@@ -24,6 +24,7 @@ use tokio::time::{Instant, sleep};
 use tracing::{debug, info, trace, warn};
 
 const DEFAULT_AGENT_PORT: u16 = 9008;
+const START_APP_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNED_AGENT_PORTS: std::ops::RangeInclusive<u16> = 19008..=19017;
 
 /// Driver 运行时配置。
@@ -461,7 +462,7 @@ impl AndroidDriver {
         };
         self.inner
             .adb
-            .shell(["am", "start", "-W", "-n", &component])
+            .shell_with_timeout(["am", "start", "-W", "-n", &component], START_APP_TIMEOUT)
             .await
             .map(|_| ())
     }

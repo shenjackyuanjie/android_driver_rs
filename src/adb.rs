@@ -136,10 +136,23 @@ impl AdbRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.shell_with_timeout(args, self.inner.config.command_timeout)
+            .await
+    }
+
+    /// 使用指定超时执行 `adb shell`。
+    pub async fn shell_with_timeout<I, S>(
+        &self,
+        args: I,
+        duration: Duration,
+    ) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut values = vec!["shell".into()];
         values.extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
-        self.run_text(values, self.inner.config.command_timeout)
-            .await
+        self.run_text(values, duration).await
     }
 
     pub async fn run_text<I, S>(&self, args: I, duration: Duration) -> Result<CommandOutput>
