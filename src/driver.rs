@@ -25,6 +25,7 @@ use tracing::{debug, info, trace, warn};
 
 const DEFAULT_AGENT_PORT: u16 = 9008;
 const START_APP_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOURCE_CLEANUP_ATTEMPTS: usize = 3;
 const OWNED_AGENT_PORTS: std::ops::RangeInclusive<u16> = 19008..=19017;
 
 /// Driver 运行时配置。
@@ -178,6 +179,128 @@ struct EstablishedSession {
     owned_agent: Option<OwnedAgent>,
 }
 
+struct ForwardGuard {
+    adb: AdbRunner,
+    forward: Option<OwnedForward>,
+}
+
+impl ForwardGuard {
+    fn new(adb: &AdbRunner, forward: OwnedForward) -> Self {
+        Self {
+            adb: adb.clone(),
+            forward: Some(forward),
+        }
+    }
+
+    fn into_inner(mut self) -> OwnedForward {
+        self.forward.take().expect("forward guard 已持有资源")
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        let Some(forward) = self.forward.as_ref() else {
+            return Ok(());
+        };
+        let result = remove_forward_with_retries(&self.adb, forward).await;
+        self.forward = None;
+        result
+    }
+}
+
+impl Drop for ForwardGuard {
+    fn drop(&mut self) {
+        let Some(forward) = self.forward.take() else {
+            return;
+        };
+        let adb = self.adb.clone();
+        spawn_cleanup(async move {
+            let _ = remove_forward_with_retries(&adb, &forward).await;
+        });
+    }
+}
+
+struct OwnedAgentGuard {
+    adb: AdbRunner,
+    agent: Option<OwnedAgent>,
+}
+
+impl OwnedAgentGuard {
+    fn new(adb: &AdbRunner, agent: OwnedAgent) -> Self {
+        Self {
+            adb: adb.clone(),
+            agent: Some(agent),
+        }
+    }
+
+    fn into_inner(mut self) -> OwnedAgent {
+        self.agent.take().expect("agent guard 已持有资源")
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        let Some(agent) = self.agent.as_mut() else {
+            return Ok(());
+        };
+        let result = stop_owned_agent_with_retries(&self.adb, agent).await;
+        self.agent = None;
+        result
+    }
+}
+
+impl Drop for OwnedAgentGuard {
+    fn drop(&mut self) {
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        let adb = self.adb.clone();
+        spawn_cleanup(async move {
+            let _ = stop_owned_agent_with_retries(&adb, &mut agent).await;
+        });
+    }
+}
+
+struct StartingAgentGuard {
+    adb: AdbRunner,
+    port: u16,
+    armed: bool,
+}
+
+impl StartingAgentGuard {
+    fn new(adb: &AdbRunner, port: u16) -> Self {
+        Self {
+            adb: adb.clone(),
+            port,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn cleanup(mut self) {
+        if self.armed
+            && let Some(pid) = agent_pid(&self.adb, self.port).await
+        {
+            let _ = self.adb.shell(["kill", &pid.to_string()]).await;
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for StartingAgentGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let adb = self.adb.clone();
+        let port = self.port;
+        spawn_cleanup(async move {
+            if let Some(pid) = agent_pid(&adb, port).await {
+                let _ = adb.shell(["kill", &pid.to_string()]).await;
+            }
+        });
+    }
+}
+
 impl AndroidDriver {
     pub fn builder() -> AndroidDriverBuilder {
         AndroidDriverBuilder::default()
@@ -241,10 +364,17 @@ impl AndroidDriver {
         if let Some(rpc) = state.rpc.take() {
             rpc.invalidate();
         }
-        restore_ime_locked(&self.inner.adb, &mut state).await?;
-        cleanup_resources(&self.inner.adb, &mut state).await?;
+        let mut cleanup_error = restore_ime_locked(&self.inner.adb, &mut state).await.err();
+        if let Err(error) = cleanup_resources(&self.inner.adb, &mut state).await
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(error);
+        }
         state.closed = true;
-        Ok(())
+        match cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub async fn display_size(&self) -> Result<DisplaySize> {
@@ -975,19 +1105,21 @@ fn verify_remote_digest(info: &RemoteFileInfo, kind: &str) -> Result<()> {
 async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<EstablishedSession> {
     info!(target: "android_driver_rs::driver", "建立 RPC 会话");
     let compatible_process = compatible_agent_process(adb, DEFAULT_AGENT_PORT).await;
-    let borrowed_forward = create_forward(adb, DEFAULT_AGENT_PORT).await?;
-    if compatible_process && ping(borrowed_forward.local_port, adb.agent_timeout()).await {
+    let borrowed_forward = ForwardGuard::new(adb, create_forward(adb, DEFAULT_AGENT_PORT).await?);
+    let borrowed_port = borrowed_forward
+        .forward
+        .as_ref()
+        .expect("forward guard 已持有资源")
+        .local_port;
+    if compatible_process && ping(borrowed_port, adb.agent_timeout()).await {
+        let forward = borrowed_forward.into_inner();
         return Ok(EstablishedSession {
-            rpc: RpcClient::new(
-                borrowed_forward.local_port,
-                config.rpc_timeout,
-                config.max_json_size,
-            ),
-            forward: borrowed_forward,
+            rpc: RpcClient::new(forward.local_port, config.rpc_timeout, config.max_json_size),
+            forward,
             owned_agent: None,
         });
     }
-    remove_forward(adb, &borrowed_forward).await?;
+    borrowed_forward.cleanup().await?;
     resolve_uiautomation_conflict(adb, config.ui_automation_conflict_policy).await?;
 
     let mut startup_errors = Vec::new();
@@ -995,9 +1127,10 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
         if remote_port_in_use(adb, port).await {
             continue;
         }
-        let mut owned_agent = match start_agent(adb, port).await {
-            Ok(value) => value,
-            Err(error) => {
+        let owned_agent = match start_agent(adb, port).await {
+            Ok(value) => OwnedAgentGuard::new(adb, value),
+            Err((error, guard)) => {
+                guard.cleanup().await;
                 warn!(
                     target: "android_driver_rs::driver",
                     remote_port = port,
@@ -1012,15 +1145,25 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
             }
         };
         let forward = match create_forward(adb, port).await {
-            Ok(value) => value,
+            Ok(forward) => ForwardGuard::new(adb, forward),
             Err(error) => {
-                let _ = stop_owned_agent(adb, &mut owned_agent).await;
-                return Err(error);
+                return match owned_agent.cleanup().await {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(DriverError::AgentStartup(format!(
+                        "创建 ADB forward 失败：{error}；随后停止 Agent 也失败：{cleanup_error}"
+                    ))),
+                };
             }
         };
+        let local_port = forward
+            .forward
+            .as_ref()
+            .expect("forward guard 已持有资源")
+            .local_port;
         let deadline = Instant::now() + adb.agent_timeout();
         loop {
-            if ping(forward.local_port, Duration::from_millis(500)).await {
+            if ping(local_port, Duration::from_millis(500)).await {
+                let forward = forward.into_inner();
                 return Ok(EstablishedSession {
                     rpc: RpcClient::new(
                         forward.local_port,
@@ -1028,7 +1171,7 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
                         config.max_json_size,
                     ),
                     forward,
-                    owned_agent: Some(owned_agent),
+                    owned_agent: Some(owned_agent.into_inner()),
                 });
             }
             if Instant::now() >= deadline {
@@ -1036,8 +1179,21 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
             }
             sleep(Duration::from_millis(200)).await;
         }
-        let _ = remove_forward(adb, &forward).await;
-        let _ = stop_owned_agent(adb, &mut owned_agent).await;
+        let forward_error = forward.cleanup().await.err();
+        let agent_error = owned_agent.cleanup().await.err();
+        if forward_error.is_some() || agent_error.is_some() {
+            let mut cleanup_errors = Vec::new();
+            if let Some(error) = forward_error {
+                cleanup_errors.push(format!("清理 ADB forward 失败：{error}"));
+            }
+            if let Some(error) = agent_error {
+                cleanup_errors.push(format!("停止 Agent 失败：{error}"));
+            }
+            return Err(DriverError::AgentStartup(format!(
+                "等待 Agent 就绪超时，且资源清理未完全成功：{}",
+                cleanup_errors.join("；")
+            )));
+        }
     }
     let detail = if startup_errors.is_empty() {
         "候选端口均已被占用".to_owned()
@@ -1049,23 +1205,33 @@ async fn establish_session(adb: &AdbRunner, config: &DriverConfig) -> Result<Est
     )))
 }
 
-async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
+async fn start_agent(
+    adb: &AdbRunner,
+    port: u16,
+) -> std::result::Result<OwnedAgent, (DriverError, StartingAgentGuard)> {
     debug!(target: "android_driver_rs::driver", remote_port = port, "启动自有 Agent");
     let existing_app_processes = app_process_pids(adb).await;
+    let mut startup_guard = StartingAgentGuard::new(adb, port);
     let classpath = format!("CLASSPATH={REMOTE_JAR}");
-    let mut host_process = adb.spawn_long_running([
-        "shell".to_owned(),
-        classpath,
-        "app_process".to_owned(),
-        "/".to_owned(),
-        "com.wetest.uia2.Main".to_owned(),
-        "-p".to_owned(),
-        port.to_string(),
-    ])?;
-    let capture = AgentCapture::attach(&mut host_process)?;
+    let mut host_process = adb
+        .spawn_long_running([
+            "shell".to_owned(),
+            classpath,
+            "app_process".to_owned(),
+            "/".to_owned(),
+            "com.wetest.uia2.Main".to_owned(),
+            "-p".to_owned(),
+            port.to_string(),
+        ])
+        .map_err(|error| (error, StartingAgentGuard::new(adb, port)))?;
+    let capture = match AgentCapture::attach(&mut host_process) {
+        Ok(capture) => capture,
+        Err(error) => return Err((error, startup_guard)),
+    };
     let deadline = Instant::now() + adb.agent_timeout();
     loop {
         if let Some(pid) = agent_pid(adb, port).await {
+            startup_guard.disarm();
             return Ok(OwnedAgent {
                 pid,
                 port,
@@ -1076,6 +1242,7 @@ async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
         if remote_port_in_use(adb, port).await
             && let Some(pid) = new_app_process_pid(adb, &existing_app_processes).await
         {
+            startup_guard.disarm();
             debug!(
                 target: "android_driver_rs::driver",
                 remote_port = port,
@@ -1089,17 +1256,23 @@ async fn start_agent(adb: &AdbRunner, port: u16) -> Result<OwnedAgent> {
                 capture,
             });
         }
-        if let Some(status) = host_process.try_wait().map_err(DriverError::AdbSpawn)? {
-            return Err(agent_startup_failure(
+        let status = match host_process.try_wait() {
+            Ok(status) => status,
+            Err(source) => return Err((DriverError::AdbSpawn(source), startup_guard)),
+        };
+        if let Some(status) = status {
+            let error = agent_startup_failure(
                 port,
                 format!("Agent 子进程在监听端口前退出（status={status:?}）"),
                 capture,
             )
-            .await);
+            .await;
+            return Err((error, startup_guard));
         }
         if Instant::now() >= deadline {
             let _ = host_process.kill().await;
-            return Err(agent_startup_failure(port, "等待 Agent PID 超时", capture).await);
+            let error = agent_startup_failure(port, "等待 Agent PID 超时", capture).await;
+            return Err((error, startup_guard));
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -1263,6 +1436,26 @@ async fn resolve_uiautomation_conflict(
             }
         }
     }
+}
+
+async fn stop_owned_agent_with_retries(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=RESOURCE_CLEANUP_ATTEMPTS {
+        match stop_owned_agent(adb, agent).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!(
+                    target: "android_driver_rs::driver",
+                    attempt,
+                    max_attempts = RESOURCE_CLEANUP_ATTEMPTS,
+                    error = %error,
+                    "停止自有 Agent 失败"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.expect("资源清理至少尝试一次"))
 }
 
 async fn stop_owned_agent(adb: &AdbRunner, agent: &mut OwnedAgent) -> Result<()> {
@@ -1499,6 +1692,27 @@ async fn create_forward(adb: &AdbRunner, remote_port: u16) -> Result<OwnedForwar
     })
 }
 
+async fn remove_forward_with_retries(adb: &AdbRunner, forward: &OwnedForward) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=RESOURCE_CLEANUP_ATTEMPTS {
+        match remove_forward(adb, forward).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!(
+                    target: "android_driver_rs::driver",
+                    attempt,
+                    max_attempts = RESOURCE_CLEANUP_ATTEMPTS,
+                    local_port = forward.local_port,
+                    error = %error,
+                    "移除 ADB forward 失败"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.expect("资源清理至少尝试一次"))
+}
+
 async fn remove_forward(adb: &AdbRunner, forward: &OwnedForward) -> Result<()> {
     trace!(target: "android_driver_rs::driver", local_port = forward.local_port, remote_port = forward.remote_port, "移除端口转发");
     let local = format!("tcp:{}", forward.local_port);
@@ -1525,26 +1739,37 @@ async fn remove_forward(adb: &AdbRunner, forward: &OwnedForward) -> Result<()> {
 
 async fn cleanup_resources(adb: &AdbRunner, state: &mut SessionState) -> Result<()> {
     debug!(target: "android_driver_rs::driver", "清理资源");
+    let mut errors = Vec::new();
     if let Some(agent) = state.owned_agent.as_mut() {
-        stop_owned_agent(adb, agent).await?;
-        state.owned_agent = None;
+        match stop_owned_agent_with_retries(adb, agent).await {
+            Ok(()) => state.owned_agent = None,
+            Err(error) => errors.push(format!("停止 Agent 失败：{error}")),
+        }
     }
-    let index = 0;
+    let mut index = 0;
     while index < state.forwards.len() {
         let forward = state.forwards[index].clone();
-        match remove_forward(adb, &forward).await {
+        match remove_forward_with_retries(adb, &forward).await {
             Ok(()) => {
                 state.forwards.remove(index);
             }
-            Err(source) => {
-                return Err(DriverError::ForwardCleanup {
-                    local_port: forward.local_port,
-                    source: Box::new(source),
-                });
+            Err(error) => {
+                errors.push(format!(
+                    "清理 ADB forward tcp:{} 失败：{error}",
+                    forward.local_port
+                ));
+                index += 1;
             }
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DriverError::AgentStartup(format!(
+            "Driver 资源清理未完全成功：{}",
+            errors.join("；")
+        )))
+    }
 }
 
 async fn restore_ime_locked(adb: &AdbRunner, state: &mut SessionState) -> Result<()> {
