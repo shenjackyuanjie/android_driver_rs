@@ -29,6 +29,18 @@ pub enum AgentSource {
 }
 
 /// 当前锁定的 Agent 描述。
+///
+/// 这是一份**编译期锁定的清单**，而不是运行期探测出来的信息：四个字段全部来自
+/// 本文件顶部的常量，描述的是本 crate 唯一支持的那一个 Agent 版本。
+///
+/// 因此 `Driver` 构造时直接使用 [`AgentProfile::default`] 是正确的，不存在
+/// “忘记从会话里填充真实值” 的问题：无论 [`AgentSource`] 是 `Embedded` 还是
+/// `Directory`，[`materialize`] 都会调用 `verify_jar` 强制比对大小与 SHA-256，
+/// 任何不匹配的 jar 都会直接报 [`DriverError::AgentVerification`] 而无法建连。
+/// 换言之，连接一旦成功，设备上跑的 jar 必然与这里的常量字节一致，
+/// 从会话“回填”只会重新得到同样的常量。
+///
+/// 需要支持多版本 Agent 时，才需要把本结构改成运行期探测并去掉固定校验。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentProfile {
     pub jar_version: &'static str,
@@ -38,6 +50,7 @@ pub struct AgentProfile {
 }
 
 impl Default for AgentProfile {
+    /// 返回锁定版本的清单。这是唯一受支持的 Agent，详见类型级说明。
     fn default() -> Self {
         Self {
             jar_version: "0.4.0",
@@ -149,6 +162,12 @@ async fn file_matches(path: &Path, expected: &[u8]) -> bool {
             .unwrap_or(false)
 }
 
+/// 强制校验 jar 与锁定清单完全一致。
+///
+/// 注意：本函数对所有 [`AgentSource`] 都会执行（包括用户自己指定的
+/// `Directory`），这正是 [`AgentProfile`] 能够做成编译期常量的前提。如果以后
+/// 放宽这里的校验（例如允许多版本 Agent），必须同步把 `AgentProfile` 改成
+/// 运行期探测，否则 `agent_profile()` 会汇报与实际不符的版本信息。
 async fn verify_jar(path: &Path) -> Result<()> {
     trace!(target: "android_driver_rs::agent", path = %path.display(), "校验 Agent");
     if !path.is_file() {

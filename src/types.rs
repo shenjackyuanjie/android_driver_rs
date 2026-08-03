@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// 设备序列号。`Debug` 和 `Display` 始终脱敏。
+///
+/// 这里故意不使用 `secrecy` 之类的包装类型。本类型的安全边界完全来自下方
+/// 手写的 `Debug`/`Display` 实现：只要不调用 [`DeviceSerial::expose_secret`]，
+/// 序列号就不可能被格式化进日志或错误消息。包装类型提供的是同一道保护，
+/// 同样拦不住“调用方主动 expose 后拉进字符串”这种用法（参见 `adb.rs` 的
+/// `redact`，无论否都需要手写），因此引入额外依赖并无实质收益。
+///
+/// 不变式由 `serial_never_formats_plaintext` 测试锅守。
 #[derive(Clone, Eq)]
 pub struct DeviceSerial(String);
 
@@ -11,6 +19,9 @@ impl DeviceSerial {
         Self(value.into())
     }
     /// 显式取得原始序列号。调用方不得记录返回值。
+    ///
+    /// 这是本类型唯一的泄露口。传给 ADB 命令行参数是预期用法；写进任何会被
+    /// 展示或持久化的文本前，必须先经过 `AdbRunner::redact`。
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
@@ -23,6 +34,9 @@ impl PartialEq for DeviceSerial {
 }
 
 impl fmt::Debug for DeviceSerial {
+    /// 恒输出占位符。不要改成输出真实值（包括“只显示后四位”之类的妥协），
+    /// 否则包含 `DeviceSerial` 的 `DeviceDescriptor` 等结构体一旦被 `{:?}`
+    /// 打印就会泄露。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("DeviceSerial(<redacted>)")
     }

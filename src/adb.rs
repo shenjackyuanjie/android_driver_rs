@@ -242,6 +242,13 @@ impl AdbRunner {
         command.spawn().map_err(DriverError::AdbSpawn)
     }
 
+    /// 将命令输出中出现的设备序列号替换为占位符。
+    ///
+    /// [`DeviceSerial`] 自身的 `Debug`/`Display` 已经脱敏，但设备返回的文本（如
+    /// `adb devices -l` 的 stdout）里的序列号是普通字符串，不受那道保护，因此
+    /// 需要在这里手写替换。换成 `secrecy` 之类的包装类型也省不掉本函数。
+    ///
+    /// 所有会被展示或写入错误的命令输出都必须先过这里。
     fn redact(&self, value: String) -> String {
         self.inner.serial.as_ref().map_or(value.clone(), |serial| {
             value.replace(serial.expose_secret(), "<redacted>")
