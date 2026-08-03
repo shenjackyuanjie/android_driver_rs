@@ -5,15 +5,29 @@ use std::collections::BTreeMap;
 use sxd_xpath::{Context, Factory, Value};
 
 /// XPath 匹配节点的不可变快照。
+///
+/// 快照只保存抓取 UI 树那一刻的属性（含 `bounds` 坐标），并记录当时的会话代际。
+/// 会话经 [`AndroidDriver::recover`] 重建后界面布局通常已经变化，快照里的坐标
+/// 不再可信，因此所有会向设备发指令的方法都会先校验代际。
 #[derive(Clone, Debug)]
 pub struct XPathElement {
     pub(crate) driver: AndroidDriver,
     attributes: BTreeMap<String, String>,
+    generation: u64,
 }
 
 impl XPathElement {
+    fn ensure_generation(&self) -> Result<()> {
+        if self.driver.generation() == self.generation {
+            Ok(())
+        } else {
+            Err(DriverError::SessionInvalid)
+        }
+    }
+
+    /// 快照是否仍属于当前会话。会话恢复后返回 `false`。
     pub fn exists(&self) -> bool {
-        true
+        self.ensure_generation().is_ok()
     }
     pub fn attribute(&self, name: &str) -> Option<&str> {
         self.attributes.get(name).map(String::as_str)
@@ -31,11 +45,13 @@ impl XPathElement {
         self.attribute("text")
     }
     pub async fn click(&self) -> Result<()> {
+        self.ensure_generation()?;
         self.driver
             .click(self.center().ok_or(DriverError::XPathNotFound)?)
             .await
     }
     pub async fn long_click(&self) -> Result<()> {
+        self.ensure_generation()?;
         self.driver
             .long_click(self.center().ok_or(DriverError::XPathNotFound)?, 800)
             .await
@@ -50,6 +66,7 @@ pub(crate) fn evaluate(
     driver: AndroidDriver,
     root: &UiNode,
     expression: &str,
+    generation: u64,
 ) -> Result<Vec<XPathElement>> {
     let package = sxd_document::parser::parse(&root.to_xml())
         .map_err(|error| DriverError::Protocol(format!("UI XML 无法用于 XPath：{error}")))?;
@@ -81,6 +98,7 @@ pub(crate) fn evaluate(
             XPathElement {
                 driver: driver.clone(),
                 attributes,
+                generation,
             }
         })
         .collect())

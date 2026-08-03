@@ -899,7 +899,9 @@ impl AndroidDriver {
     }
 
     pub async fn xpath_all(&self, expression: &str) -> Result<Vec<XPathElement>> {
-        crate::xpath::evaluate(self.clone(), &self.ui_tree().await?, expression)
+        // 先取代际再抓树：若抓取期间发生 recover()，快照会被判定为过期而非静默陈旧。
+        let generation = self.generation();
+        crate::xpath::evaluate(self.clone(), &self.ui_tree().await?, expression, generation)
     }
     pub async fn xpath_optional(&self, expression: &str) -> Result<Option<XPathElement>> {
         Ok(self.xpath_all(expression).await?.into_iter().next())
