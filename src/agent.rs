@@ -162,7 +162,7 @@ async fn verify_jar(path: &Path) -> Result<()> {
             "u2.jar 大小应为 {JAR_SIZE} bytes"
         )));
     }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let digest = hex_sha256(&bytes);
     if digest != JAR_SHA256 {
         warn!(target: "android_driver_rs::agent", "Agent SHA-256 不匹配");
         return Err(DriverError::AgentVerification(
@@ -171,6 +171,15 @@ async fn verify_jar(path: &Path) -> Result<()> {
     }
     trace!(target: "android_driver_rs::agent", "Agent 验证通过");
     Ok(())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        use std::fmt::Write as _;
+        write!(output, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    output
 }
 
 #[cfg(test)]
