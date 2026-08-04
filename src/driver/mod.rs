@@ -326,6 +326,10 @@ impl AndroidDriver {
     pub fn generation(&self) -> u64 {
         self.inner.generation.load(Ordering::Acquire)
     }
+    #[cfg(feature = "blocking")]
+    pub(crate) fn wait_interval(&self) -> Duration {
+        self.inner.config.wait_interval
+    }
     /// 调用 u2 HTTP JSON-RPC。调用不会自动重放。
     pub async fn call_json_rpc(&self, method: &str, params: Value) -> Result<Value> {
         trace!(target: "android_driver_rs::driver", method, "调用 RPC");

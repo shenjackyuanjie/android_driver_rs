@@ -210,6 +210,17 @@ impl AndroidDriver {
         trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::wait_for");
         block_on(self.inner.wait_for(selector, timeout))?.map(|inner| Element { inner })
     }
+    pub fn wait_until_gone(&self, selector: &Selector, timeout: Duration) -> Result<bool> {
+        trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::wait_until_gone");
+        block_on(self.inner.wait_until_gone(selector, timeout))?
+    }
+    pub fn wait_until<F>(&self, timeout: Duration, condition: F) -> Result<bool>
+    where
+        F: FnMut() -> Result<bool>,
+    {
+        trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::wait_until");
+        super::wait_until(timeout, self.inner.wait_interval(), condition)
+    }
     pub fn wait_for_xpath(&self, expression: &str, timeout: Duration) -> Result<XPathElement> {
         trace!(target: "android_driver_rs::blocking", "阻塞 AndroidDriver::wait_for_xpath");
         block_on(self.inner.wait_for_xpath(expression, timeout))?

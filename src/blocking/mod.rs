@@ -11,6 +11,7 @@ pub use xpath::XPathElement;
 use crate::{DriverError, Result};
 use std::future::Future;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tracing::{debug, trace};
 
@@ -32,8 +33,37 @@ pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output> {
     Ok(runtime.block_on(future))
 }
 
+pub(crate) fn wait_until<F>(timeout: Duration, interval: Duration, mut condition: F) -> Result<bool>
+where
+    F: FnMut() -> Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition()? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now < deadline {
+            std::thread::sleep(std::cmp::min(interval, deadline - now));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn blocking_wait_condition_runs_outside_tokio_context() {
+        let result = wait_until(Duration::from_millis(20), Duration::from_millis(1), || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            Ok(true)
+        });
+        assert!(result.unwrap());
+    }
+
     #[tokio::test]
     async fn rejects_nested_blocking() {
         assert!(matches!(
